@@ -29,6 +29,10 @@ pub enum ReqError {
     Transport(#[from] Box<dyn std::error::Error + Send + Sync>),
     #[error("Request timed out")]
     Timeout,
+    #[error("Invalid endpoint: {0}")]
+    InvalidEndpoint(String),
+    #[error("Too many active requests")]
+    TooManyRequests,
 }
 
 pub enum Command {

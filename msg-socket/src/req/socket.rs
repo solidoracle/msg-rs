@@ -1,3 +1,5 @@
+const MAX_ACTIVE_REQUESTS: usize = 10;
+
 use bytes::Bytes;
 use msg_transport::ClientTransport;
 use msg_wire::reqrep;
@@ -6,6 +8,7 @@ use std::time::Duration;
 use std::{collections::VecDeque, sync::Arc};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::codec::Framed;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::{req::stats::SocketStats, req::SocketState};
 
@@ -21,6 +24,8 @@ pub struct ReqSocket<T: ClientTransport> {
     options: Arc<ReqOptions>,
     /// Socket state. This is shared with the backend task.
     state: Arc<SocketState>,
+    /// The currently active requests.
+    active_requests: Arc<AtomicUsize>,
 }
 
 impl<T: ClientTransport> ReqSocket<T> {
@@ -34,6 +39,7 @@ impl<T: ClientTransport> ReqSocket<T> {
             transport,
             options: Arc::new(options),
             state: Arc::new(SocketState::default()),
+            active_requests: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -41,7 +47,12 @@ impl<T: ClientTransport> ReqSocket<T> {
         &self.state.stats
     }
 
-    pub async fn request(&self, message: Bytes) -> Result<Bytes, ReqError> {
+    pub async fn request(&self, message: Bytes) -> Result<Bytes, ReqError> {  
+        if self.active_requests.load(Ordering::SeqCst) >= MAX_ACTIVE_REQUESTS {
+            return Err(ReqError::TooManyRequests);
+        } 
+        self.active_requests.fetch_add(1, Ordering::SeqCst);
+
         let (response_tx, response_rx) = oneshot::channel();
 
         self.to_driver
@@ -62,8 +73,7 @@ impl<T: ClientTransport> ReqSocket<T> {
         // Initialize communication channels
         let (to_driver, from_socket) = mpsc::channel(DEFAULT_BUFFER_SIZE);
 
-        // TODO: return error
-        let endpoint = endpoint.parse().unwrap();
+        let endpoint = endpoint.parse().map_err(|_| ReqError::InvalidEndpoint(endpoint.to_string()))?;
 
         tracing::debug!("Connected to {}", endpoint);
 
@@ -87,6 +97,7 @@ impl<T: ClientTransport> ReqSocket<T> {
             timeout_check_interval: tokio::time::interval(Duration::from_millis(
                 self.options.timeout.as_millis() as u64 / 10,
             )),
+            active_requests: Arc::clone(&self.active_requests),
         };
 
         // Spawn the backend task
@@ -107,31 +118,34 @@ mod tests {
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
-    use tracing::Instrument;
 
     async fn spawn_listener(sleep_duration: Duration) -> SocketAddr {
-        let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let listener = TcpListener::bind("0.0.0.0:0").await.expect("Failed to bind listener");
 
-        let addr = listener.local_addr().unwrap();
+        let addr = listener.local_addr().expect("Failed to get local address");
 
-        tokio::spawn(
-            async move {
-                let (mut socket, _) = listener.accept().await.unwrap();
-                tracing::info!("Accepted connection");
-
-                let mut buf = [0u8; 1024];
-                let b = socket.read(&mut buf).await.unwrap();
-                let read = &buf[..b];
-
-                tokio::time::sleep(sleep_duration).await;
-
-                socket.write_all(read).await.unwrap();
-                tracing::info!("Sent bytes: {:?}", read);
-
-                socket.flush().await.unwrap();
+        tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((mut socket, _)) => {
+                        tokio::spawn(async move {
+                            let mut buf = [0u8; 1024];
+                            match socket.read(&mut buf).await {
+                                Ok(b) => {
+                                    let read = &buf[..b];
+                                    tokio::time::sleep(sleep_duration).await;
+                                    if socket.write_all(read).await.is_ok() {
+                                        tracing::info!("Sent bytes: {:?}", read);
+                                    }
+                                }
+                                Err(e) => tracing::error!("Failed to read from socket: {:?}", e),
+                            }
+                        });
+                    }
+                    Err(e) => tracing::error!("Failed to accept connection: {:?}", e),
+                }
             }
-            .instrument(tracing::info_span!("listener")),
-        );
+        });
 
         addr
     }
@@ -207,5 +221,51 @@ mod tests {
             "Request succeeded when it should have timed out: {:?}",
             response.ok()
         );
+    }
+    
+    #[tokio::test]
+    async fn test_req_socket_too_many_requests() {
+        let _ = tracing_subscriber::fmt::try_init();
+    
+        let addr = spawn_listener(Duration::from_secs(0)).await;
+    
+        let mut socket = ReqSocket::with_options(
+            Tcp::new(),
+            ReqOptions {
+                auth_token: None,
+                timeout: Duration::from_secs(10),
+                retry_on_initial_failure: true,
+                backoff_duration: Duration::from_secs(1),
+                retry_attempts: Some(3),
+                set_nodelay: true,
+            },
+        );
+    
+        let addr_str = addr.to_string();
+        let connect_result = socket.connect(&addr_str).await;
+        assert!(
+            connect_result.is_ok(),
+            "Failed to connect: {:?}",
+            connect_result.err()
+        );
+    
+        let request = Bytes::from_static(b"test request");
+    
+        // Send MAX_ACTIVE_REQUESTS requests
+        for _ in 0..MAX_ACTIVE_REQUESTS {
+            let _ = socket.request(request.clone()).await;
+        }
+    
+        // Add a small delay to ensure all requests are still pending
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Try to send one more request
+        let response = socket.request(request.clone()).await;
+    
+        // Check that the response is a TooManyRequests error
+        match response {
+            Err(ReqError::TooManyRequests) => {} // This is expected
+            _ => panic!("Expected TooManyRequests error, got {:?}", response),
+        }
     }
 }

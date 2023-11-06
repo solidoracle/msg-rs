@@ -19,6 +19,7 @@ use super::{Command, ReqError, ReqOptions};
 use msg_wire::reqrep;
 use std::time::Instant;
 use tokio::time::Interval;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// The request socket driver. Endless future that drives
 /// the the socket forward.
@@ -40,6 +41,8 @@ pub(crate) struct ReqDriver<T: AsyncRead + AsyncWrite> {
     pub(crate) pending_requests: FxHashMap<u32, PendingRequest>,
     /// Interval for checking for request timeouts.
     pub(crate) timeout_check_interval: Interval,
+    /// The currently active requests.
+    pub(crate) active_requests: Arc<AtomicUsize>,
 }
 
 pub(crate) struct PendingRequest {
@@ -65,6 +68,8 @@ impl<T: AsyncRead + AsyncWrite> ReqDriver<T> {
             // Update stats
             self.socket_state.stats.update_rtt(rtt);
             self.socket_state.stats.increment_rx(size);
+
+            self.active_requests.fetch_sub(1, Ordering::SeqCst);
         }
     }
 
@@ -85,6 +90,7 @@ impl<T: AsyncRead + AsyncWrite> ReqDriver<T> {
         for id in timed_out_ids {
             if let Some(pending_request) = self.pending_requests.remove(&id) {
                 let _ = pending_request.sender.send(Err(ReqError::Timeout));
+                self.active_requests.fetch_sub(1, Ordering::SeqCst);
             }
         }
     }
